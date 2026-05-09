@@ -1,0 +1,10 @@
+{
+  "network": "sepolia",
+  "address": "0xaB35dd9c736cdA3F11EC0A14AB7eA20fD7A66533",
+  "itemName": "Sealed-Bid Trophy NFT",
+  "itemDescription": "Demo confidential auction on Zama FHEVM Sepolia. Bids are encrypted client-side; only the winner is revealed.",
+  "durationSeconds": 604800,
+  "deployer": "0x518A612F93d3D83495879bE50C6292d26C0aeC2c",
+  "deployedAt": "2026-05-09T15:20:24.347Z",
+  "txHash": "0x395d5e0b8f428f6c29678a55d438ce6156ae5d2d3641041a6d891a23a5ef5d82"
+}

@@ -1,0 +1,10 @@
+node_modules
+.env
+artifacts
+cache
+dist
+typechain-types
+fhevmTemp
+*.log
+frontend/node_modules
+frontend/dist
