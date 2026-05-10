@@ -43,15 +43,25 @@ function formatRemaining(seconds) {
   return `${m}m ${sec}s`;
 }
 
+// ─── Local bundle SDK loader ──────────────────────────────
 let _fhevmInstance = null;
+let createInstance = null;
+let SepoliaConfig = null;
+
+async function loadSDK() {
+  if (createInstance) return;
+  const m = await import('./sdk-bundle.js');
+  createInstance = m.createInstance;
+  SepoliaConfig = m.SepoliaConfig;
+  if (m.initSDK) await m.initSDK();
+}
+
 async function getFhevmInstance() {
   if (_fhevmInstance) return _fhevmInstance;
-  if (!window.relayerSDK) throw new Error('relayer SDK not loaded');
-  const { initSDK, createInstance, SepoliaConfig } = window.relayerSDK;
-  await initSDK();
+  await loadSDK();
   _fhevmInstance = await createInstance({
     ...SepoliaConfig,
-    network: window.ethereum,
+    network: 'https://ethereum-sepolia-rpc.publicnode.com',
   });
   return _fhevmInstance;
 }
