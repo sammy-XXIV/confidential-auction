@@ -2250,3 +2250,92 @@ npm run build
 - Check network is Sepolia (chainId 11155111) before any transaction
 - `CONTRACT_ADDRESS` and `BACKEND_URL` must be updated after deployment
 
+---
+
+## 16. Frontend Deployment — GitHub Pages WASM Path Fix
+
+### The Problem
+
+`@zama-fhe/relayer-sdk` hardcodes WASM fetch paths as absolute URLs:
+
+```js
+"/tfhe_bg.wasm"
+"/kms_lib_bg.wasm"
+```
+
+These resolve to the **origin root** (`https://user.github.io/tfhe_bg.wasm`).
+GitHub Pages project sites live at a **subdirectory** (`https://user.github.io/repo/`).
+The WASM files are in `dist/` which maps to `https://user.github.io/repo/tfhe_bg.wasm`.
+Result: **404 → "Failed to execute 'compile' on 'WebAssembly': HTTP status code is not ok"**
+
+Patching `window.fetch` in the main thread does NOT fix this — WASM is loaded inside a Web Worker where the patch doesn't reach.
+
+### The Fix — Edit the Pre-built Bundle
+
+Do a targeted string replacement in the pre-built bundle before committing it:
+
+```bash
+# Replace with your actual repo/subdirectory name
+sed -i 's|"/tfhe_bg.wasm"|"/your-repo-name/tfhe_bg.wasm"|g' frontend/public/relayer-sdk/relayer-sdk-js.js
+sed -i 's|"/kms_lib_bg.wasm"|"/your-repo-name/kms_lib_bg.wasm"|g' frontend/public/relayer-sdk/relayer-sdk-js.js
+```
+
+Verify: `grep -c "your-repo-name" frontend/public/relayer-sdk/relayer-sdk-js.js` should return `2`.
+
+For Vercel / Netlify / root-domain hosting, the paths are correct as-is — no fix needed.
+
+### sdk-bundle.js — Always Required, Never Auto-generated
+
+The `App.jsx` pattern `await import('./sdk-bundle.js')` requires this file to exist in `src/`. It is **never created automatically** by any package or build tool. Always create it manually:
+
+```js
+// frontend/src/sdk-bundle.js
+const sdkUrl = new URL("../relayer-sdk/relayer-sdk-js.js", import.meta.url).href;
+const mod = await import(sdkUrl);
+
+export const createInstance = mod.createInstance;
+export const SepoliaConfig  = mod.SepoliaConfig;
+export const initSDK        = mod.initSDK;
+```
+
+Key points:
+- Use `new URL("...", import.meta.url).href` for the SDK path — resolves correctly regardless of base URL or subdirectory
+- Do NOT use absolute paths like `"/relayer-sdk/relayer-sdk-js.js"` — Rollup will fail to resolve them at build time
+- Do NOT use `/* @vite-ignore */` with `vite-plugin-top-level-await` — the comment is stripped before Rollup sees it
+- `import.meta.url` in the compiled `dist/assets/sdk-bundle-[hash].js` resolves relative to the actual deployed URL
+
+### Vite Config Requirements
+
+```js
+export default defineConfig({
+  base: './',          // required for GitHub Pages subdirectory
+  build: {
+    target: 'esnext', // required for top-level await in sdk-bundle.js
+  },
+});
+```
+
+### WASM Files Location
+
+Place the pre-built bundle and WASM files in `public/`:
+
+```
+frontend/public/
+  tfhe_bg.wasm          ← served at /repo/tfhe_bg.wasm (after bundle path fix)
+  kms_lib_bg.wasm       ← served at /repo/kms_lib_bg.wasm (after bundle path fix)
+  relayer-sdk/
+    relayer-sdk-js.js   ← the pre-built SDK bundle
+    workerHelpers.js    ← required for Web Worker WASM loading
+```
+
+Do NOT place WASM files in `src/` — Vite will try to process them. Keep them in `public/`.
+
+### SDK Package Confusion
+
+The SKILL.md table above says `@fhevm/sdk` is for React/browser. This is outdated for v1.0.0-alpha. In practice:
+
+- `@fhevm/sdk@1.0.0-alpha.x` — exports are empty (`export {}`), API is `createFhevmClient` not `createInstance`
+- `@zama-fhe/relayer-sdk` — has `"browser": "lib/web.js"` field, exports `createInstance` + `SepoliaConfig` + `initSDK`, works in browser via the pre-built bundle approach above
+
+Use the **pre-built bundle** (`relayer-sdk-js.js`) for browser apps, not direct npm imports. Vite cannot reliably handle the WASM initialization when importing `@zama-fhe/relayer-sdk` directly as an npm dependency.
+
