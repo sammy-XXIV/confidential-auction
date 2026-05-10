@@ -1541,34 +1541,15 @@ pnpm deploy:sepolia
 
 There are three related but distinct packages:
 
-| Package | Use case |
-|---------|----------|
-| `@zama-fhe/relayer-sdk` | Node.js backend — user decryption, encrypt for scripts |
-| `@fhevm/sdk` | React/browser frontend dApps |
-| `fhevmjs` | Old GitHub repo name — now published as `@zama-fhe/relayer-sdk` |
+| Package | Use case | Notes |
+|---------|----------|-------|
+| `@zama-fhe/relayer-sdk` | Node.js backend AND browser frontend | Use the pre-built bundle for browser — see Section 16 |
+| `@fhevm/sdk` | **DO NOT USE for browser** | v1.0.0-alpha.x exports are empty (`export {}`), API is `createFhevmClient` not `createInstance` |
+| `fhevmjs` | Old GitHub repo name | Now published as `@zama-fhe/relayer-sdk` |
 
-**For React frontend (fhevmjs / @fhevm/sdk):**
+**For browser frontend — use the pre-built bundle (see Section 16):**
 
-```bash
-npm install @fhevm/sdk
-```
-
-```typescript
-import { createInstance } from '@fhevm/sdk';
-import { BrowserProvider } from 'ethers';
-
-const provider = new BrowserProvider(window.ethereum);
-const instance = await createInstance({ provider });
-
-// Encrypt value
-const encrypted = await instance
-  .createEncryptedInput(contractAddress, userAddress)
-  .add64(BigInt(amount))
-  .encrypt();
-
-const handle     = encrypted.handles[0];
-const inputProof = encrypted.inputProof;
-```
+Do NOT `npm install @zama-fhe/relayer-sdk` and import it directly in Vite/React — WASM initialization fails at build time. Instead, use the pre-built bundle from `node_modules/@zama-fhe/relayer-sdk/lib/web.js` placed in `public/relayer-sdk/` with sed-patched WASM paths.
 
 **For Node.js backend (relayer-sdk):**
 
@@ -1664,59 +1645,135 @@ await wrappedUSDC.wrap(userAddress, amount);
 
 ---
 
-## 33. Public Decryption Pattern
+## 33. Public Decryption Pattern — CRITICAL (v0.11.1+)
 
-Different from user decryption. Used when the contract owner or a trusted party needs to decrypt a value publicly — not tied to a specific user's wallet signature.
+**WARNING: The Gateway callback pattern (`Gateway.requestDecryption` + `onlyGateway` callback) is OUTDATED and does NOT work in `@fhevm/solidity@0.11.1`.** The correct pattern uses `FHE.makePubliclyDecryptable()` + `FHE.checkSignatures()`.
+
+Different from user decryption. Used when results should be readable by **anyone** — vote tallies, auction outcomes, public scores.
 
 ### When to Use
 
-- Admin needs to read an encrypted total for reporting
-- Contract needs to reveal a result after a deadline (e.g. auction winner)
-- Verifiable public output after computation completes
+- Reveal vote tallies after voting ends
+- Reveal auction winner publicly
+- Any encrypted value that should become public after a trigger
 
-### Pattern
+### Correct Pattern (@fhevm/solidity@0.11.1)
+
+Two-step flow: contract marks handles → frontend fetches KMS decryption → contract verifies and stores plaintext.
+
+**Step 1: Contract marks tallies as publicly decryptable**
 
 ```solidity
-// Contract requests public decryption
-// The gateway decrypts and calls back a function on your contract
-
-import { IGateway } from "@fhevm/solidity/lib/FHE.sol";
+import {FHE, euint64, externalEuint64} from "@fhevm/solidity/lib/FHE.sol";
 
 contract MyContract is ZamaEthereumConfig {
-    uint64 public revealedValue;
     euint64 private _secret;
+    uint64  public  revealedValue;
+    bool    public  decryptionPending;
+    bool    public  resultsRevealed;
 
-    // Step 1: Request public decryption
-    function requestReveal() external {
-        uint256[] memory handles = new uint256[](1);
-        handles[0] = Gateway.toUint256(_secret);
-        Gateway.requestDecryption(
-            handles,
-            this.callbackReveal.selector,
-            0,           // msg.value for gateway fee
-            block.timestamp + 100,  // deadline
-            false        // not trustless
-        );
+    event DecryptionRequested(bytes32 handle);
+
+    // Owner triggers public decryption
+    function requestReveal() external onlyOwner {
+        require(!decryptionPending, "Already pending");
+        euint64 marked = FHE.makePubliclyDecryptable(_secret);
+        _secret = marked;
+        decryptionPending = true;
+        emit DecryptionRequested(euint64.unwrap(marked));
     }
 
-    // Step 2: Gateway calls this back with plaintext
-    function callbackReveal(
-        uint256 /*requestID*/,
-        uint64 decryptedValue
-    ) external onlyGateway {
-        revealedValue = decryptedValue;
+    // Get raw bytes32 handle for frontend to pass to publicDecrypt
+    function getSecretHandle() external view returns (bytes32) {
+        return euint64.unwrap(_secret);
+    }
+
+    // Anyone submits the KMS decryption result — FHE.checkSignatures verifies on-chain
+    function submitDecryptionResult(
+        bytes32[] calldata handlesList,
+        bytes calldata abiEncodedCleartexts,
+        bytes calldata decryptionProof
+    ) external {
+        require(decryptionPending, "Not pending");
+        require(!resultsRevealed, "Already revealed");
+
+        // Reverts if KMS signatures are invalid
+        FHE.checkSignatures(handlesList, abiEncodedCleartexts, decryptionProof);
+
+        (uint64 value) = abi.decode(abiEncodedCleartexts, (uint64));
+        revealedValue = value;
+        decryptionPending = false;
+        resultsRevealed = true;
     }
 }
 ```
+
+**Step 2: Frontend calls `instance.publicDecrypt()` then submits proof**
+
+```javascript
+// After requestReveal() tx confirms:
+const handle = await roContract.getSecretHandle(); // bytes32
+const result = await instance.publicDecrypt([handle]);
+// result: { clearValues, abiEncodedClearValues, decryptionProof }
+
+await contract.submitDecryptionResult(
+  [handle],
+  result.abiEncodedClearValues,
+  result.decryptionProof,
+  { gasLimit: 500_000n }
+);
+
+// Now revealedValue is readable by anyone
+const value = await roContract.revealedValue();
+```
+
+**Multiple values (e.g. for/against tallies):**
+
+```solidity
+// In contract — handle order must match abiEncodedCleartexts order
+function submitDecryptionResult(
+    bytes32[] calldata handlesList,   // [forHandle, againstHandle]
+    bytes calldata abiEncodedCleartexts,  // abi.encode(uint64, uint64)
+    bytes calldata decryptionProof
+) external {
+    FHE.checkSignatures(handlesList, abiEncodedCleartexts, decryptionProof);
+    (uint64 votesFor, uint64 votesAgainst) = abi.decode(abiEncodedCleartexts, (uint64, uint64));
+    // store...
+}
+```
+
+```javascript
+// Frontend — pass handles in same order as contract expects
+const [forHandle, againstHandle] = await Promise.all([
+  roContract.getVotesForHandle(proposalId),
+  roContract.getVotesAgainstHandle(proposalId),
+]);
+const result = await instance.publicDecrypt([forHandle, againstHandle]);
+await contract.submitDecryptionResult(
+  [forHandle, againstHandle],
+  result.abiEncodedClearValues,
+  result.decryptionProof
+);
+```
+
+### Key Rules
+
+- `FHE.makePubliclyDecryptable(handle)` returns the SAME euint64 — store the return value
+- `euint64.unwrap(handle)` gives the `bytes32` the frontend needs
+- `FHE.checkSignatures` reverts on bad signatures — no need for manual require
+- Handle order in `handlesList` must exactly match the order of values in `abiEncodedCleartexts`
+- `submitDecryptionResult` can be called by ANYONE — it's permissionless (KMS proof does the auth)
 
 ### Key Differences vs User Decryption
 
 | | User Decryption | Public Decryption |
 |--|----------------|-------------------|
-| Who decrypts | Individual user via EIP-712 | Gateway callback to contract |
-| Result | Returned to user only | Stored publicly onchain |
-| Use case | Show user their own balance | Reveal auction result, admin read |
-| Flow | Frontend signs → backend decrypts | Contract requests → gateway calls back |
+| Who decrypts | Individual user via EIP-712 wallet signature | KMS relayer, proof submitted on-chain |
+| Result | Returned to user only (private) | Stored publicly on-chain, readable by anyone |
+| Use case | Show user their own balance | Reveal vote tally, auction result |
+| Contract side | `FHE.allow(handle, userAddress)` | `FHE.makePubliclyDecryptable(handle)` |
+| Frontend SDK call | `instance.userDecrypt(...)` | `instance.publicDecrypt([handle1, handle2])` |
+| On-chain verification | None (off-chain only) | `FHE.checkSignatures(handlesList, cleartext, proof)` |
 
 ---
 
@@ -1892,7 +1949,69 @@ main().catch(console.error);
 
 ---
 
-## 36. Test File Template
+## 36. Deploying from Android / Termux — Remix IDE Required
+
+**Hardhat CANNOT compile or deploy on Android (Termux).** The `@nomicfoundation/edr` package requires a native binary (`edr-android-arm64`) that does not exist. Any `npx hardhat compile` or `npx hardhat run` will fail with:
+
+```
+Error: Cannot find module '@nomicfoundation/edr-android-arm64'
+```
+
+### Solution: Deploy via Remix IDE
+
+Use [remix.ethereum.org](https://remix.ethereum.org) from your mobile or desktop browser.
+
+**Step 1: Get a flattened contract**
+
+FHEVM contracts use npm imports (`@fhevm/solidity/...`). Remix needs raw GitHub URLs or a flattened file. Use these import substitutions for Remix:
+
+```solidity
+// Replace npm imports with raw GitHub URLs for Remix
+import "https://raw.githubusercontent.com/zama-ai/fhevm/refs/heads/main/lib/FHE.sol";
+import "https://raw.githubusercontent.com/zama-ai/fhevm/refs/heads/main/config/ZamaConfig.sol";
+```
+
+**Step 2: Compile in Remix**
+
+- Compiler tab → `0.8.24` → Enable optimization (200 runs)
+- EVM version: `cancun`
+- Click Compile
+
+**Step 3: Deploy**
+
+- Deploy tab → Environment: `Injected Provider - MetaMask`
+- Switch MetaMask to Sepolia
+- Click Deploy → confirm in MetaMask
+- Copy the deployed address from the Remix terminal
+
+**Step 4: Update frontend**
+
+```javascript
+// frontend/src/App.jsx or config.js
+const CONTRACT_ADDRESS = "0xYourNewAddress";
+```
+
+Then rebuild and redeploy the frontend (e.g. `npm run build` + push to GitHub Pages).
+
+### Workflow for Termux Developers
+
+```
+Write contract in Termux (VSCode/vim)
+    ↓
+Push to GitHub
+    ↓
+Open Remix → load from GitHub or paste contract
+    ↓
+Compile + Deploy via MetaMask on Sepolia
+    ↓
+Copy address → update frontend/src/App.jsx in Termux
+    ↓
+npm run build + gh push → GitHub Pages
+```
+
+---
+
+## 38. Test File Template
 
 Use this as the base for all FHEVM contract tests. Runs on local Hardhat network with mock encryption.
 
@@ -1972,7 +2091,7 @@ npx hardhat test test/ConfidentialVoting.test.ts
 
 ---
 
-## 37. Frontend Template (React + Vite + ethers.js)
+## 39. Frontend Template (React + Vite + ethers.js)
 
 Use this as the base for all FHEVM dApp frontends. Built with React + Vite — the same stack as the official fhevm-react-template.
 
